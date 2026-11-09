@@ -105,9 +105,9 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
     // Sort libraries so movies are prioritized before TV series
     libraries.sort_by_key(|lib| {
         let col = lib.collection_type.as_deref().unwrap_or("");
-        if col == "movies" || lib.name.to_lowercase().contains("film") || lib.name.to_lowercase().contains("movie") {
+        if col == "movies" || (col.is_empty() && lib.name.to_lowercase().starts_with("film")) {
             0
-        } else if col == "tvshows" || lib.name.to_lowercase().contains("dizi") || lib.name.to_lowercase().contains("show") || lib.name.to_lowercase().contains("series") {
+        } else if col == "tvshows" || (col.is_empty() && lib.name.to_lowercase().starts_with("dizi")) {
             1
         } else {
             2
@@ -133,9 +133,9 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
 
         let col_type = lib.collection_type.as_deref().unwrap_or("");
         let is_movies = col_type == "movies"
-            || (col_type.is_empty() && (lib.name.to_lowercase().contains("film") || lib.name.to_lowercase().contains("movie")));
+            || (col_type.is_empty() && (lib.name.to_lowercase().starts_with("film") || lib.name.to_lowercase().starts_with("movie")));
         let is_series = col_type == "tvshows"
-            || (col_type.is_empty() && (lib.name.to_lowercase().contains("dizi") || lib.name.to_lowercase().contains("show") || lib.name.to_lowercase().contains("series")));
+            || (col_type.is_empty() && (lib.name.to_lowercase().starts_with("dizi") || lib.name.to_lowercase().starts_with("show") || lib.name.to_lowercase().starts_with("series")));
 
         if is_movies {
             if !config.include_movies {
