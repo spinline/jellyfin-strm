@@ -1,0 +1,21 @@
+services:
+  jellyfin-strm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jellyfin-strm:latest
+    container_name: jellyfin-strm
+    restart: unless-stopped
+    environment:
+      - JELLYFIN_URL=${JELLYFIN_URL}
+      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME}
+      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
+      - OUTPUT_DIR=/media
+      - SCAN_INTERVAL_MINUTES=${SCAN_INTERVAL_MINUTES:-360}
+      - CLEAN_DELETED=${CLEAN_DELETED:-true}
+      - INCLUDE_MOVIES=${INCLUDE_MOVIES:-true}
+      - INCLUDE_SERIES=${INCLUDE_SERIES:-true}
+      - RUST_LOG=info
+    volumes:
+      - ${HOST_MEDIA_DIR:-/vol1/1000/Docker/strm}:/media

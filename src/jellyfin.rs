@@ -1,0 +1,303 @@
+use anyhow::{bail, Context, Result};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde::Deserialize;
+use tracing::{debug, info};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Library {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "CollectionType")]
+    pub collection_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaSource {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: Option<String>,
+    #[serde(rename = "Path")]
+    pub path: Option<String>,
+    #[serde(rename = "Container")]
+    pub container: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MovieItem {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Path")]
+    pub path: Option<String>,
+    #[serde(rename = "ProductionYear")]
+    pub production_year: Option<u32>,
+    #[serde(rename = "MediaSources", default)]
+    pub media_sources: Vec<MediaSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EpisodeItem {
+    #[serde(rename = "Id")]
+    pub id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "SeriesName")]
+    pub series_name: Option<String>,
+    #[serde(rename = "SeasonName")]
+    pub season_name: Option<String>,
+    #[serde(rename = "IndexNumber")]
+    pub index_number: Option<u32>,
+    #[serde(rename = "Path")]
+    pub path: Option<String>,
+    #[serde(rename = "MediaSources", default)]
+    pub media_sources: Vec<MediaSource>,
+}
+
+#[derive(Deserialize)]
+struct AuthResponse {
+    #[serde(rename = "AccessToken")]
+    access_token: String,
+    #[serde(rename = "User")]
+    user: UserInfo,
+}
+
+#[derive(Deserialize)]
+struct UserInfo {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ItemsResponse<T> {
+    #[serde(rename = "Items")]
+    items: Vec<T>,
+    #[serde(rename = "TotalRecordCount")]
+    total_record_count: Option<usize>,
+}
+
+pub struct JellyfinClient {
+    client: reqwest::Client,
+    pub base_url: String,
+    username: Option<String>,
+    password: Option<String>,
+    pub user_id: Option<String>,
+    pub token: Option<String>,
+    device_id: String,
+}
+
+impl JellyfinClient {
+    pub fn new(
+        base_url: String,
+        username: Option<String>,
+        password: Option<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+
+        let device_id = "jellyfin-strm-nas".to_string();
+
+        Self {
+            client,
+            base_url,
+            username,
+            password,
+            user_id: None,
+            token: api_key,
+            device_id,
+        }
+    }
+
+    fn auth_header(&self) -> String {
+        let token_part = if let Some(ref t) = self.token {
+            format!(", Token=\"{}\"", t)
+        } else {
+            String::new()
+        };
+        format!(
+            "MediaBrowser Client=\"JellyfinSTRM\", Device=\"NAS\", DeviceId=\"{}\", Version=\"1.0.0\"{}",
+            self.device_id, token_part
+        )
+    }
+
+    pub async fn authenticate(&mut self) -> Result<()> {
+        if let (Some(u), Some(p)) = (&self.username, &self.password) {
+            info!("Authenticating with Jellyfin as user '{}'...", u);
+            let url = format!("{}/Users/AuthenticateByName", self.base_url);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&self.auth_header())?,
+            );
+
+            let body = serde_json::json!({
+                "Username": u,
+                "Pw": p,
+            });
+
+            let resp = self
+                .client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to send login request to Jellyfin")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let txt = resp.text().await.unwrap_or_default();
+                bail!("Jellyfin authentication failed (HTTP {}): {}", status, txt);
+            }
+
+            let auth_data: AuthResponse = resp
+                .json()
+                .await
+                .context("Failed to parse Jellyfin authentication response")?;
+
+            self.token = Some(auth_data.access_token);
+            self.user_id = Some(auth_data.user.id);
+            info!("Successfully authenticated! User ID: {}", self.user_id.as_deref().unwrap_or(""));
+            Ok(())
+        } else if self.token.is_some() {
+            // Static API key provided, resolve User ID
+            let url = format!("{}/Users", self.base_url);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&self.auth_header())?,
+            );
+            let resp = self.client.get(&url).headers(headers).send().await?;
+            if resp.status().is_success() {
+                let users: Vec<UserInfo> = resp.json().await.unwrap_or_default();
+                if let Some(first) = users.first() {
+                    self.user_id = Some(first.id.clone());
+                    info!("Resolved User ID from API key: {}", first.id);
+                }
+            }
+            Ok(())
+        } else {
+            bail!("No username/password or API key provided for Jellyfin");
+        }
+    }
+
+    pub async fn get_libraries(&self) -> Result<Vec<Library>> {
+        let user_id = self.user_id.as_ref().context("User ID not resolved")?;
+        let url = format!("{}/Users/{}/Views", self.base_url, user_id);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.auth_header())?,
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("Failed to fetch libraries from Jellyfin")?;
+
+        if resp.status().as_u16() == 401 {
+            bail!("Unauthorized (token expired)");
+        }
+
+        let data: ItemsResponse<Library> = resp.json().await?;
+        Ok(data.items)
+    }
+
+    pub async fn get_movies_page(
+        &self,
+        library_id: &str,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<(Vec<MovieItem>, usize)> {
+        let user_id = self.user_id.as_ref().context("User ID not resolved")?;
+        let url = format!("{}/Users/{}/Items", self.base_url, user_id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.auth_header())?,
+        );
+
+        let query = [
+            ("ParentId", library_id),
+            ("IncludeItemTypes", "Movie"),
+            ("Recursive", "true"),
+            ("Fields", "MediaSources,Path,OriginalTitle,ProductionYear"),
+            ("SortBy", "SortName"),
+            ("SortOrder", "Ascending"),
+            ("StartIndex", &start_index.to_string()),
+            ("Limit", &limit.to_string()),
+        ];
+
+        let resp = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&query)
+            .send()
+            .await
+            .context("Failed to fetch movies from Jellyfin")?;
+
+        if resp.status().as_u16() == 401 {
+            bail!("Unauthorized (token expired)");
+        }
+
+        let data: ItemsResponse<MovieItem> = resp.json().await?;
+        let total = data.total_record_count.unwrap_or(data.items.len());
+        Ok((data.items, total))
+    }
+
+    pub async fn get_episodes_page(
+        &self,
+        library_id: &str,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<(Vec<EpisodeItem>, usize)> {
+        let user_id = self.user_id.as_ref().context("User ID not resolved")?;
+        let url = format!("{}/Users/{}/Items", self.base_url, user_id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.auth_header())?,
+        );
+
+        let query = [
+            ("ParentId", library_id),
+            ("IncludeItemTypes", "Episode"),
+            ("Recursive", "true"),
+            ("Fields", "MediaSources,Path,SeriesName,SeasonName,IndexNumber,ParentIndexNumber"),
+            ("SortBy", "SortName"),
+            ("SortOrder", "Ascending"),
+            ("StartIndex", &start_index.to_string()),
+            ("Limit", &limit.to_string()),
+        ];
+
+        let resp = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&query)
+            .send()
+            .await
+            .context("Failed to fetch episodes from Jellyfin")?;
+
+        if resp.status().as_u16() == 401 {
+            bail!("Unauthorized (token expired)");
+        }
+
+        let data: ItemsResponse<EpisodeItem> = resp.json().await?;
+        let total = data.total_record_count.unwrap_or(data.items.len());
+        Ok((data.items, total))
+    }
+}
