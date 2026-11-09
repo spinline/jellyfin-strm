@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -99,8 +99,20 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
         config.image_concurrency,
     );
 
-    let libraries = client.get_libraries().await?;
+    let mut libraries = client.get_libraries().await?;
     info!("Found {} libraries on Jellyfin", libraries.len());
+
+    // Sort libraries so movies are prioritized before TV series
+    libraries.sort_by_key(|lib| {
+        let col = lib.collection_type.as_deref().unwrap_or("");
+        if col == "movies" || lib.name.to_lowercase().contains("film") || lib.name.to_lowercase().contains("movie") {
+            0
+        } else if col == "tvshows" || lib.name.to_lowercase().contains("dizi") || lib.name.to_lowercase().contains("show") || lib.name.to_lowercase().contains("series") {
+            1
+        } else {
+            2
+        }
+    });
 
     let arc_client = Arc::new(JellyfinClient::new(
         client.base_url.clone(),
@@ -184,7 +196,7 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
                 }
                 generator.sync_series_metadata(&series_items, &target_dir, &arc_client).await?;
                 series_processed += count;
-                debug!("[{}] Series metadata progress: {}/{}", lib.name, series_processed, series_total);
+                info!("[{}] Series metadata progress: {}/{}", lib.name, series_processed, series_total);
                 if count < series_page_size || series_processed >= series_total {
                     break;
                 }
