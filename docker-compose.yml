@@ -16,6 +16,12 @@ services:
       - CLEAN_DELETED=${CLEAN_DELETED:-true}
       - INCLUDE_MOVIES=${INCLUDE_MOVIES:-true}
       - INCLUDE_SERIES=${INCLUDE_SERIES:-true}
+      - DOWNLOAD_IMAGES=${DOWNLOAD_IMAGES:-true}
+      - GENERATE_NFO=${GENERATE_NFO:-true}
+      - MOVIES_DIR_NAME=${MOVIES_DIR_NAME:-Movies}
+      - SERIES_DIR_NAME=${SERIES_DIR_NAME:-TV Shows}
+      - USE_LIBRARY_NAMES=${USE_LIBRARY_NAMES:-false}
+      - IMAGE_CONCURRENCY=${IMAGE_CONCURRENCY:-16}
       - RUST_LOG=info
     volumes:
       - ${HOST_MEDIA_DIR:-/vol1/1000/Docker/strm}:/media

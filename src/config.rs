@@ -20,6 +20,18 @@ pub struct Config {
     pub include_series: bool,
     #[serde(default)]
     pub library_filter: Vec<String>,
+    #[serde(default = "default_movies_dir")]
+    pub movies_dir_name: String,
+    #[serde(default = "default_series_dir")]
+    pub series_dir_name: String,
+    #[serde(default = "default_false")]
+    pub use_library_names: bool,
+    #[serde(default = "default_true")]
+    pub download_images: bool,
+    #[serde(default = "default_true")]
+    pub generate_nfo: bool,
+    #[serde(default = "default_image_concurrency")]
+    pub image_concurrency: usize,
 }
 
 fn default_output_dir() -> PathBuf {
@@ -32,6 +44,22 @@ fn default_scan_interval() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_movies_dir() -> String {
+    "Movies".to_string()
+}
+
+fn default_series_dir() -> String {
+    "TV Shows".to_string()
+}
+
+fn default_image_concurrency() -> usize {
+    16
 }
 
 impl Config {
@@ -90,6 +118,32 @@ impl Config {
         if let Ok(v) = env::var("INCLUDE_SERIES") {
             cfg.include_series = v.trim().eq_ignore_ascii_case("true") || v.trim() == "1";
         }
+        if let Ok(v) = env::var("MOVIES_DIR_NAME") {
+            if !v.trim().is_empty() {
+                cfg.movies_dir_name = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = env::var("SERIES_DIR_NAME") {
+            if !v.trim().is_empty() {
+                cfg.series_dir_name = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = env::var("USE_LIBRARY_NAMES") {
+            cfg.use_library_names = v.trim().eq_ignore_ascii_case("true") || v.trim() == "1";
+        }
+        if let Ok(v) = env::var("DOWNLOAD_IMAGES") {
+            cfg.download_images = v.trim().eq_ignore_ascii_case("true") || v.trim() == "1";
+        }
+        if let Ok(v) = env::var("GENERATE_NFO") {
+            cfg.generate_nfo = v.trim().eq_ignore_ascii_case("true") || v.trim() == "1";
+        }
+        if let Ok(v) = env::var("IMAGE_CONCURRENCY") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                if n > 0 {
+                    cfg.image_concurrency = n;
+                }
+            }
+        }
 
         // Clean URL
         cfg.jellyfin_url = cfg.jellyfin_url.trim_end_matches('/').to_string();
@@ -125,6 +179,27 @@ impl Config {
         let include_series = env::var("INCLUDE_SERIES")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(true);
+        let movies_dir_name = env::var("MOVIES_DIR_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(default_movies_dir);
+        let series_dir_name = env::var("SERIES_DIR_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(default_series_dir);
+        let use_library_names = env::var("USE_LIBRARY_NAMES")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        let download_images = env::var("DOWNLOAD_IMAGES")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(true);
+        let generate_nfo = env::var("GENERATE_NFO")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(true);
+        let image_concurrency = env::var("IMAGE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_image_concurrency);
 
         Ok(Self {
             jellyfin_url,
@@ -137,6 +212,12 @@ impl Config {
             include_movies,
             include_series,
             library_filter: Vec::new(),
+            movies_dir_name,
+            series_dir_name,
+            use_library_names,
+            download_images,
+            generate_nfo,
+            image_concurrency,
         })
     }
 }
