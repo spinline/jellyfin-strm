@@ -184,7 +184,8 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
 
             info!("Scanning series library: '{}' -> {:?}", lib.name, target_dir);
 
-            // Sync series posters/metadata
+            // Sync series posters/metadata and build series_folder_map
+            let mut series_folder_map = std::collections::HashMap::new();
             let mut series_start = 0;
             let series_page_size = 500;
             let mut series_processed = 0;
@@ -194,7 +195,9 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
                 if count == 0 {
                     break;
                 }
-                generator.sync_series_metadata(&series_items, &target_dir, &arc_client).await?;
+                generator
+                    .sync_series_metadata(&series_items, &target_dir, &arc_client, &mut series_folder_map, &mut all_active_files)
+                    .await?;
                 series_processed += count;
                 info!("[{}] Series metadata progress: {}/{}", lib.name, series_processed, series_total);
                 if count < series_page_size || series_processed >= series_total {
@@ -214,7 +217,9 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
                 if count == 0 {
                     break;
                 }
-                generator.generate_episode_batch(&items, &target_dir, &mut all_active_files)?;
+                generator
+                    .generate_episode_batch(&items, &target_dir, &series_folder_map, &mut all_active_files, &arc_client)
+                    .await?;
                 processed += count;
                 info!("[{}] Progress: {}/{} episodes synced", lib.name, processed, total);
 

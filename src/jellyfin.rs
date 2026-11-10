@@ -110,8 +110,13 @@ pub struct EpisodeItem {
     pub id: String,
     #[serde(rename = "Name")]
     pub name: String,
+    #[serde(rename = "SeriesId")]
+    pub series_id: Option<String>,
     #[serde(rename = "SeriesName")]
     pub series_name: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "SeasonId")]
+    pub season_id: Option<String>,
     #[serde(rename = "SeasonName")]
     pub season_name: Option<String>,
     #[serde(rename = "IndexNumber")]
@@ -120,6 +125,14 @@ pub struct EpisodeItem {
     pub parent_index_number: Option<u32>,
     #[serde(rename = "Path")]
     pub path: Option<String>,
+    #[serde(rename = "Overview")]
+    pub overview: Option<String>,
+    #[serde(rename = "CommunityRating")]
+    pub community_rating: Option<f32>,
+    #[serde(rename = "PremiereDate")]
+    pub premiere_date: Option<String>,
+    #[serde(rename = "ImageTags", default)]
+    pub image_tags: HashMap<String, String>,
     #[serde(rename = "MediaSources", default)]
     pub media_sources: Vec<MediaSource>,
 }
@@ -394,7 +407,7 @@ impl JellyfinClient {
             ("Recursive", "true"),
             (
                 "Fields",
-                "MediaSources,Path,SeriesName,SeasonName,IndexNumber,ParentIndexNumber",
+                "MediaSources,Path,SeriesId,SeriesName,SeasonId,SeasonName,IndexNumber,ParentIndexNumber,Overview,CommunityRating,PremiereDate,ImageTags",
             ),
             ("SortBy", "SortName"),
             ("SortOrder", "Ascending"),

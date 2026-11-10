@@ -1,6 +1,6 @@
 use crate::jellyfin::{EpisodeItem, JellyfinClient, MovieItem, SeriesItem};
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,21 +76,25 @@ impl StrmGenerator {
                         warn!("Failed to write {:?}: {}", nfo_path, e);
                     }
                 }
+                active_files.insert(nfo_path);
             }
 
             // 2. Queue images if enabled (only if file doesn't already exist on disk)
             if self.download_images {
                 let poster_path = movie_dir.join("poster.jpg");
+                active_files.insert(poster_path.clone());
                 if !poster_path.exists() && movie.image_tags.contains_key("Primary") {
                     image_tasks.push((movie.id.clone(), "Primary".to_string(), poster_path));
                 }
 
                 let bg_path = movie_dir.join("background.jpg");
+                active_files.insert(bg_path.clone());
                 if !bg_path.exists() && !movie.backdrop_image_tags.is_empty() {
                     image_tasks.push((movie.id.clone(), "Backdrop".to_string(), bg_path));
                 }
 
                 let logo_path = movie_dir.join("logo.png");
+                active_files.insert(logo_path.clone());
                 if !logo_path.exists() && movie.image_tags.contains_key("Logo") {
                     image_tasks.push((movie.id.clone(), "Logo".to_string(), logo_path));
                 }
@@ -161,12 +165,20 @@ impl StrmGenerator {
         series_items: &[SeriesItem],
         target_dir: &Path,
         client: &Arc<JellyfinClient>,
+        series_folder_map: &mut HashMap<String, String>,
+        active_files: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         let mut image_tasks: Vec<(String, String, PathBuf)> = Vec::new();
 
         for series in series_items {
             let folder_name = Self::generate_movie_folder_name(&series.name, series.production_year);
-            let series_dir = target_dir.join(sanitize_folder(&folder_name));
+            let sanitized = sanitize_folder(&folder_name);
+
+            // Register in mapping
+            series_folder_map.insert(series.id.clone(), sanitized.clone());
+            series_folder_map.insert(series.name.to_lowercase(), sanitized.clone());
+
+            let series_dir = target_dir.join(&sanitized);
 
             if let Err(e) = fs::create_dir_all(&series_dir) {
                 warn!("Failed to create series folder {:?}: {}", series_dir, e);
@@ -182,21 +194,25 @@ impl StrmGenerator {
                         warn!("Failed to write {:?}: {}", nfo_path, e);
                     }
                 }
+                active_files.insert(nfo_path);
             }
 
             // Series images
             if self.download_images {
                 let poster_path = series_dir.join("poster.jpg");
+                active_files.insert(poster_path.clone());
                 if !poster_path.exists() && series.image_tags.contains_key("Primary") {
                     image_tasks.push((series.id.clone(), "Primary".to_string(), poster_path));
                 }
 
                 let bg_path = series_dir.join("background.jpg");
+                active_files.insert(bg_path.clone());
                 if !bg_path.exists() && !series.backdrop_image_tags.is_empty() {
                     image_tasks.push((series.id.clone(), "Backdrop".to_string(), bg_path));
                 }
 
                 let logo_path = series_dir.join("logo.png");
+                active_files.insert(logo_path.clone());
                 if !logo_path.exists() && series.image_tags.contains_key("Logo") {
                     image_tasks.push((series.id.clone(), "Logo".to_string(), logo_path));
                 }
@@ -210,78 +226,119 @@ impl StrmGenerator {
         Ok(())
     }
 
-    pub fn generate_episode_batch(
+    pub async fn generate_episode_batch(
         &self,
         episodes: &[EpisodeItem],
         target_dir: &Path,
+        series_folder_map: &HashMap<String, String>,
         active_files: &mut HashSet<PathBuf>,
+        client: &Arc<JellyfinClient>,
     ) -> Result<(usize, usize)> {
         let mut created_count = 0;
         let mut unchanged_count = 0;
+        let mut image_tasks: Vec<(String, String, PathBuf)> = Vec::new();
+        let mut thumb_links: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for ep in episodes {
-            let series_folder = ep.series_name.as_deref().unwrap_or("Unknown Series");
-            let season_folder = ep.season_name.as_deref().unwrap_or("Season 1");
+            let series_folder = ep
+                .series_id
+                .as_deref()
+                .and_then(|sid| series_folder_map.get(sid))
+                .or_else(|| {
+                    ep.series_name
+                        .as_deref()
+                        .and_then(|sn| series_folder_map.get(&sn.to_lowercase()))
+                })
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| ep.series_name.as_deref().unwrap_or("Unknown Series"));
+
+            let season_folder = match ep.parent_index_number {
+                Some(0) => "Specials".to_string(),
+                Some(s) => format!("Season {:02}", s),
+                None => ep.season_name.as_deref().unwrap_or("Season 01").to_string(),
+            };
 
             let episode_dir = target_dir
                 .join(sanitize_folder(series_folder))
-                .join(sanitize_folder(season_folder));
+                .join(sanitize_folder(&season_folder));
 
             if let Err(e) = fs::create_dir_all(&episode_dir) {
                 warn!("Failed to create folder {:?}: {}", episode_dir, e);
                 continue;
             }
 
-            if ep.media_sources.is_empty() {
-                let base_name = ep.path.as_deref().and_then(extract_real_basename).unwrap_or_else(|| {
-                    match (ep.parent_index_number, ep.index_number) {
-                        (Some(s), Some(e)) => format!("{} - S{:02}E{:02} - {}", series_folder, s, e, ep.name),
-                        (_, Some(e)) => format!("{} - E{:02} - {}", series_folder, e, ep.name),
-                        _ => format!("{} - {}", series_folder, ep.name),
-                    }
-                });
-
-                let file_name = format!("{}.strm", sanitize_file(&base_name));
-                let file_path = episode_dir.join(file_name);
-                let stream_url = format!(
-                    "{}/Videos/{}/stream?static=true&api_key={}",
-                    self.base_url, ep.id, self.token
-                );
-
-                if write_strm_if_changed(&file_path, &stream_url)? {
-                    created_count += 1;
-                } else {
-                    unchanged_count += 1;
+            let base_name = ep.path.as_deref().and_then(extract_real_basename).unwrap_or_else(|| {
+                match (ep.parent_index_number, ep.index_number) {
+                    (Some(s), Some(e)) => format!("{} - S{:02}E{:02} - {}", series_folder, s, e, ep.name),
+                    (_, Some(e)) => format!("{} - E{:02} - {}", series_folder, e, ep.name),
+                    _ => format!("{} - {}", series_folder, ep.name),
                 }
-                active_files.insert(file_path);
+            });
+
+            let sanitized_base = sanitize_file(&base_name);
+
+            // 1. STRM file
+            let file_name = format!("{}.strm", sanitized_base);
+            let file_path = episode_dir.join(file_name);
+            let stream_id = ep
+                .media_sources
+                .first()
+                .map(|ms| ms.id.as_str())
+                .unwrap_or(ep.id.as_str());
+
+            let stream_url = format!(
+                "{}/Videos/{}/stream?static=true&api_key={}",
+                self.base_url, stream_id, self.token
+            );
+
+            if write_strm_if_changed(&file_path, &stream_url)? {
+                created_count += 1;
             } else {
-                for ms in &ep.media_sources {
-                    let base_name = ms
-                        .path
-                        .as_deref()
-                        .or(ep.path.as_deref())
-                        .and_then(extract_real_basename)
-                        .unwrap_or_else(|| {
-                            match (ep.parent_index_number, ep.index_number) {
-                                (Some(s), Some(e)) => format!("{} - S{:02}E{:02} - {}", series_folder, s, e, ep.name),
-                                (_, Some(e)) => format!("{} - E{:02} - {}", series_folder, e, ep.name),
-                                _ => format!("{} - {}", series_folder, ep.name),
-                            }
-                        });
+                unchanged_count += 1;
+            }
+            active_files.insert(file_path);
 
-                    let file_name = format!("{}.strm", sanitize_file(&base_name));
-                    let file_path = episode_dir.join(file_name);
-                    let stream_url = format!(
-                        "{}/Videos/{}/stream?static=true&api_key={}",
-                        self.base_url, ms.id, self.token
-                    );
-
-                    if write_strm_if_changed(&file_path, &stream_url)? {
-                        created_count += 1;
-                    } else {
-                        unchanged_count += 1;
+            // 2. Episode NFO file
+            if self.generate_nfo {
+                let nfo_path = episode_dir.join(format!("{}.nfo", sanitized_base));
+                if !nfo_path.exists() {
+                    let xml = generate_episode_nfo(ep, series_folder);
+                    if let Err(e) = fs::write(&nfo_path, xml) {
+                        warn!("Failed to write episode NFO {:?}: {}", nfo_path, e);
                     }
-                    active_files.insert(file_path);
+                }
+                active_files.insert(nfo_path);
+            }
+
+            // 3. Episode Image (Thumbnail)
+            if self.download_images && ep.image_tags.contains_key("Primary") {
+                let img_path = episode_dir.join(format!("{}.jpg", sanitized_base));
+                let thumb_path = episode_dir.join(format!("{}-thumb.jpg", sanitized_base));
+
+                active_files.insert(img_path.clone());
+                active_files.insert(thumb_path.clone());
+
+                if !img_path.exists() && !thumb_path.exists() {
+                    image_tasks.push((ep.id.clone(), "Primary".to_string(), img_path.clone()));
+                    thumb_links.push((img_path, thumb_path));
+                } else if img_path.exists() && !thumb_path.exists() {
+                    let _ = fs::hard_link(&img_path, &thumb_path);
+                } else if !img_path.exists() && thumb_path.exists() {
+                    let _ = fs::hard_link(&thumb_path, &img_path);
+                }
+            }
+        }
+
+        // Execute concurrent episode image downloads
+        if !image_tasks.is_empty() {
+            download_images_concurrently(image_tasks, client, self.image_concurrency).await;
+
+            // Create hardlinks for thumb.jpg for instant Kodi/Plex compatibility with 0 extra bytes
+            for (src, dst) in thumb_links {
+                if src.exists() && !dst.exists() {
+                    if let Err(_) = fs::hard_link(&src, &dst) {
+                        let _ = fs::copy(&src, &dst);
+                    }
                 }
             }
         }
@@ -305,11 +362,21 @@ impl StrmGenerator {
                 } else {
                     debug!("Deleted orphan strm: {:?}", file);
                     deleted_count += 1;
+
+                    // Also remove accompanying .nfo, .jpg, -thumb.jpg if they exist
+                    let stem = file.with_extension("");
+                    let nfo = stem.with_extension("nfo");
+                    let jpg = stem.with_extension("jpg");
+                    let thumb = PathBuf::from(format!("{}-thumb.jpg", stem.to_string_lossy()));
+
+                    let _ = fs::remove_file(nfo);
+                    let _ = fs::remove_file(jpg);
+                    let _ = fs::remove_file(thumb);
                 }
             }
         }
 
-        // Clean up empty directories and leftover metadata for deleted movies
+        // Clean up empty directories and leftover metadata for deleted movies/shows
         clean_empty_and_orphaned_dirs(&self.output_dir);
 
         if deleted_count > 0 {
@@ -503,6 +570,38 @@ pub fn generate_series_nfo(series: &SeriesItem) -> String {
     }
 
     out.push_str("</tvshow>\n");
+    out
+}
+
+pub fn generate_episode_nfo(ep: &EpisodeItem, series_title: &str) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    out.push_str("<episodedetails>\n");
+
+    out.push_str(&format!("  <title>{}</title>\n", escape_xml(&ep.name)));
+    out.push_str(&format!("  <showtitle>{}</showtitle>\n", escape_xml(series_title)));
+
+    if let Some(s) = ep.parent_index_number {
+        out.push_str(&format!("  <season>{}</season>\n", s));
+    }
+    if let Some(e) = ep.index_number {
+        out.push_str(&format!("  <episode>{}</episode>\n", e));
+    }
+
+    if let Some(ref plot) = ep.overview {
+        out.push_str(&format!("  <plot>{}</plot>\n", escape_xml(plot)));
+    }
+
+    if let Some(rating) = ep.community_rating {
+        out.push_str(&format!("  <rating>{:.1}</rating>\n", rating));
+    }
+
+    if let Some(ref date) = ep.premiere_date {
+        let clean = date.split('T').next().unwrap_or(date);
+        out.push_str(&format!("  <aired>{}</aired>\n", escape_xml(clean)));
+    }
+
+    out.push_str("</episodedetails>\n");
     out
 }
 
@@ -705,5 +804,34 @@ mod tests {
         assert!(xml.contains("<director>Christopher Nolan</director>"));
         assert!(xml.contains("<name>Matthew McConaughey</name>"));
         assert!(xml.contains("<uniqueid type=\"imdb\" default=\"true\">tt0816692</uniqueid>"));
+    }
+
+    #[test]
+    fn test_generate_episode_nfo() {
+        let ep = EpisodeItem {
+            id: "ep1".to_string(),
+            name: "Pilot".to_string(),
+            series_id: Some("s1".to_string()),
+            series_name: Some("Breaking Bad".to_string()),
+            season_id: Some("season1".to_string()),
+            season_name: Some("Season 1".to_string()),
+            index_number: Some(1),
+            parent_index_number: Some(1),
+            path: None,
+            overview: Some("Walter White starts cooking...".to_string()),
+            community_rating: Some(9.2),
+            premiere_date: Some("2008-01-20T00:00:00Z".to_string()),
+            image_tags: HashMap::new(),
+            media_sources: vec![],
+        };
+
+        let xml = generate_episode_nfo(&ep, "Breaking Bad (2008)");
+        assert!(xml.contains("<title>Pilot</title>"));
+        assert!(xml.contains("<showtitle>Breaking Bad (2008)</showtitle>"));
+        assert!(xml.contains("<season>1</season>"));
+        assert!(xml.contains("<episode>1</episode>"));
+        assert!(xml.contains("<plot>Walter White starts cooking...</plot>"));
+        assert!(xml.contains("<rating>9.2</rating>"));
+        assert!(xml.contains("<aired>2008-01-20</aired>"));
     }
 }
