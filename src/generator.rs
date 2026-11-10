@@ -377,7 +377,7 @@ impl StrmGenerator {
         }
 
         // Clean up empty directories and leftover metadata for deleted movies/shows
-        clean_empty_and_orphaned_dirs(&self.output_dir);
+        clean_empty_and_orphaned_dirs(&self.output_dir, &self.output_dir);
 
         if deleted_count > 0 {
             info!("Cleaned up {} removed strm files from disk", deleted_count);
@@ -703,11 +703,26 @@ fn collect_strm_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn clean_empty_and_orphaned_dirs(dir: &Path) {
+fn clean_empty_and_orphaned_dirs(dir: &Path, root: &Path) {
     if !dir.is_dir() {
         return;
     }
 
+    // 1. Recurse into child directories first
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                clean_empty_and_orphaned_dirs(&path, root);
+            }
+        }
+    }
+
+    if dir == root || dir == Path::new("/") {
+        return;
+    }
+
+    // 2. Re-read directory contents after children may have been deleted
     if let Ok(entries) = fs::read_dir(dir) {
         let mut has_strm = false;
         let mut has_subdirs = false;
@@ -716,7 +731,6 @@ fn clean_empty_and_orphaned_dirs(dir: &Path) {
             let path = entry.path();
             if path.is_dir() {
                 has_subdirs = true;
-                clean_empty_and_orphaned_dirs(&path);
             } else if path.extension().and_then(|s| s.to_str()) == Some("strm") {
                 has_strm = true;
             }
@@ -724,7 +738,7 @@ fn clean_empty_and_orphaned_dirs(dir: &Path) {
 
         // If a directory has no subdirectories and no .strm files, it is an orphaned or empty folder
         // Remove auxiliary files (nfo, images) and remove the directory
-        if !has_subdirs && !has_strm && dir != Path::new("/") {
+        if !has_subdirs && !has_strm {
             if let Ok(leftovers) = fs::read_dir(dir) {
                 for item in leftovers.flatten() {
                     let _ = fs::remove_file(item.path());
@@ -833,5 +847,55 @@ mod tests {
         assert!(xml.contains("<plot>Walter White starts cooking...</plot>"));
         assert!(xml.contains("<rating>9.2</rating>"));
         assert!(xml.contains("<aired>2008-01-20</aired>"));
+    }
+
+    #[test]
+    fn test_clean_orphans_removes_nested_empty_directories() {
+        let root = std::env::temp_dir().join(format!("test_strm_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();
+
+        // Simulate old folder without year: TV Shows/Breaking Bad/Season 01/ep1.strm
+        let old_series = root.join("Breaking Bad");
+        let old_season = old_series.join("Season 01");
+        fs::create_dir_all(&old_season).unwrap();
+        let orphan_strm = old_season.join("ep1.strm");
+        fs::write(&orphan_strm, "http://example.com").unwrap();
+        let orphan_nfo = old_season.join("ep1.nfo");
+        fs::write(&orphan_nfo, "test nfo").unwrap();
+
+        // Simulate active file in new folder: TV Shows/Breaking Bad (2008)/Season 01/ep1.strm
+        let new_series = root.join("Breaking Bad (2008)");
+        let new_season = new_series.join("Season 01");
+        fs::create_dir_all(&new_season).unwrap();
+        let active_strm = new_season.join("ep1.strm");
+        fs::write(&active_strm, "http://example.com").unwrap();
+
+        let mut active_files = HashSet::new();
+        active_files.insert(active_strm.clone());
+
+        let generator = StrmGenerator::new(
+            "http://jellyfin".to_string(),
+            "token".to_string(),
+            root.clone(),
+            true,
+            true,
+            true,
+            4,
+        );
+
+        let deleted = generator.clean_orphans(&active_files).unwrap();
+        assert_eq!(deleted, 1);
+
+        // Active file and its folder must still exist
+        assert!(active_strm.exists());
+        assert!(new_series.exists());
+
+        // Orphan file and its nested directories must be completely removed
+        assert!(!orphan_strm.exists());
+        assert!(!orphan_nfo.exists());
+        assert!(!old_season.exists());
+        assert!(!old_series.exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
