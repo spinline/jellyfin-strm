@@ -177,7 +177,7 @@ impl JellyfinClient {
         api_key: Option<String>,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap_or_default();
 
@@ -295,6 +295,28 @@ impl JellyfinClient {
         Ok(data.items)
     }
 
+    async fn send_with_retry(&self, req_builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let req = req_builder
+                .try_clone()
+                .ok_or_else(|| anyhow::anyhow!("Request not cloneable"))?;
+            match req.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if attempts < 3 => {
+                    tracing::warn!(
+                        "Jellyfin request failed (attempt {}/3): {}. Retrying in 2s...",
+                        attempts,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     pub async fn get_movies_page(
         &self,
         library_id: &str,
@@ -323,12 +345,9 @@ impl JellyfinClient {
             ("Limit", &limit.to_string()),
         ];
 
+        let req = self.client.get(&url).headers(headers).query(&query);
         let resp = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .query(&query)
-            .send()
+            .send_with_retry(req)
             .await
             .context("Failed to fetch movies from Jellyfin")?;
 
@@ -369,12 +388,9 @@ impl JellyfinClient {
             ("Limit", &limit.to_string()),
         ];
 
+        let req = self.client.get(&url).headers(headers).query(&query);
         let resp = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .query(&query)
-            .send()
+            .send_with_retry(req)
             .await
             .context("Failed to fetch series from Jellyfin")?;
 
@@ -415,12 +431,9 @@ impl JellyfinClient {
             ("Limit", &limit.to_string()),
         ];
 
+        let req = self.client.get(&url).headers(headers).query(&query);
         let resp = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .query(&query)
-            .send()
+            .send_with_retry(req)
             .await
             .context("Failed to fetch episodes from Jellyfin")?;
 
@@ -448,7 +461,8 @@ impl JellyfinClient {
             HeaderValue::from_str(&self.auth_header())?,
         );
 
-        let resp = self.client.get(&url).headers(headers).send().await?;
+        let req = self.client.get(&url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         if resp.status().is_success() {
             let bytes = resp.bytes().await?;

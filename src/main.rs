@@ -102,12 +102,12 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
     let mut libraries = client.get_libraries().await?;
     info!("Found {} libraries on Jellyfin", libraries.len());
 
-    // Sort libraries so movies are prioritized before TV series
+    // Sort libraries so TV series are prioritized first
     libraries.sort_by_key(|lib| {
         let col = lib.collection_type.as_deref().unwrap_or("");
-        if col == "movies" || (col.is_empty() && lib.name.to_lowercase().starts_with("film")) {
+        if col == "tvshows" || (col.is_empty() && lib.name.to_lowercase().starts_with("dizi")) {
             0
-        } else if col == "tvshows" || (col.is_empty() && lib.name.to_lowercase().starts_with("dizi")) {
+        } else if col == "movies" || (col.is_empty() && lib.name.to_lowercase().starts_with("film")) {
             1
         } else {
             2
@@ -137,41 +137,7 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
         let is_series = col_type == "tvshows"
             || (col_type.is_empty() && (lib.name.to_lowercase().starts_with("dizi") || lib.name.to_lowercase().starts_with("show") || lib.name.to_lowercase().starts_with("series")));
 
-        if is_movies {
-            if !config.include_movies {
-                continue;
-            }
-            let target_dir = if config.use_library_names {
-                config.output_dir.join(generator::sanitize_folder(&lib.name))
-            } else {
-                config.output_dir.join(&config.movies_dir_name)
-            };
-            std::fs::create_dir_all(&target_dir)?;
-
-            info!("Scanning movie library: '{}' -> {:?}", lib.name, target_dir);
-
-            let mut start_index = 0;
-            let page_size = 500;
-            let mut processed = 0;
-
-            loop {
-                let (items, total) = client.get_movies_page(&lib.id, start_index, page_size).await?;
-                let count = items.len();
-                if count == 0 {
-                    break;
-                }
-                generator
-                    .generate_movie_batch(&items, &target_dir, &mut all_active_files, &arc_client)
-                    .await?;
-                processed += count;
-                info!("[{}] Progress: {}/{} movies synced", lib.name, processed, total);
-
-                if count < page_size || processed >= total {
-                    break;
-                }
-                start_index += count;
-            }
-        } else if is_series {
+        if is_series {
             if !config.include_series {
                 continue;
             }
@@ -187,46 +153,110 @@ async fn run_sync(client: &mut JellyfinClient, config: &Config) -> Result<usize>
             // Sync series posters/metadata and build series_folder_map
             let mut series_folder_map = std::collections::HashMap::new();
             let mut series_start = 0;
-            let series_page_size = 500;
+            let series_page_size = 100;
             let mut series_processed = 0;
             loop {
-                let (series_items, series_total) = client.get_series_page(&lib.id, series_start, series_page_size).await?;
-                let count = series_items.len();
-                if count == 0 {
-                    break;
+                match client.get_series_page(&lib.id, series_start, series_page_size).await {
+                    Ok((series_items, series_total)) => {
+                        let count = series_items.len();
+                        if count == 0 {
+                            break;
+                        }
+                        if let Err(e) = generator
+                            .sync_series_metadata(&series_items, &target_dir, &arc_client, &mut series_folder_map, &mut all_active_files)
+                            .await
+                        {
+                            error!("Error syncing series batch: {:#}", e);
+                        }
+                        series_processed += count;
+                        info!("[{}] Series metadata progress: {}/{}", lib.name, series_processed, series_total);
+                        if count < series_page_size || series_processed >= series_total {
+                            break;
+                        }
+                        series_start += count;
+                    }
+                    Err(e) => {
+                        error!("Failed to fetch series page at index {}: {:#}", series_start, e);
+                        break;
+                    }
                 }
-                generator
-                    .sync_series_metadata(&series_items, &target_dir, &arc_client, &mut series_folder_map, &mut all_active_files)
-                    .await?;
-                series_processed += count;
-                info!("[{}] Series metadata progress: {}/{}", lib.name, series_processed, series_total);
-                if count < series_page_size || series_processed >= series_total {
-                    break;
-                }
-                series_start += count;
             }
 
             // Sync episodes
             let mut start_index = 0;
-            let page_size = 500;
+            let page_size = 200;
             let mut processed = 0;
 
             loop {
-                let (items, total) = client.get_episodes_page(&lib.id, start_index, page_size).await?;
-                let count = items.len();
-                if count == 0 {
-                    break;
-                }
-                generator
-                    .generate_episode_batch(&items, &target_dir, &series_folder_map, &mut all_active_files, &arc_client)
-                    .await?;
-                processed += count;
-                info!("[{}] Progress: {}/{} episodes synced", lib.name, processed, total);
+                match client.get_episodes_page(&lib.id, start_index, page_size).await {
+                    Ok((items, total)) => {
+                        let count = items.len();
+                        if count == 0 {
+                            break;
+                        }
+                        if let Err(e) = generator
+                            .generate_episode_batch(&items, &target_dir, &series_folder_map, &mut all_active_files, &arc_client)
+                            .await
+                        {
+                            error!("Error syncing episode batch: {:#}", e);
+                        }
+                        processed += count;
+                        info!("[{}] Progress: {}/{} episodes synced", lib.name, processed, total);
 
-                if count < page_size || processed >= total {
-                    break;
+                        if count < page_size || processed >= total {
+                            break;
+                        }
+                        start_index += count;
+                    }
+                    Err(e) => {
+                        error!("Failed to fetch episodes page at index {}: {:#}", start_index, e);
+                        break;
+                    }
                 }
-                start_index += count;
+            }
+        } else if is_movies {
+            if !config.include_movies {
+                continue;
+            }
+            let target_dir = if config.use_library_names {
+                config.output_dir.join(generator::sanitize_folder(&lib.name))
+            } else {
+                config.output_dir.join(&config.movies_dir_name)
+            };
+            std::fs::create_dir_all(&target_dir)?;
+
+            info!("Scanning movie library: '{}' -> {:?}", lib.name, target_dir);
+
+            let mut start_index = 0;
+            let page_size = 100;
+            let mut processed = 0;
+
+            loop {
+                match client.get_movies_page(&lib.id, start_index, page_size).await {
+                    Ok((items, total)) => {
+                        let count = items.len();
+                        if count == 0 {
+                            break;
+                        }
+                        if let Err(e) = generator
+                            .generate_movie_batch(&items, &target_dir, &mut all_active_files, &arc_client)
+                            .await
+                        {
+                            error!("Error syncing movie batch: {:#}", e);
+                        }
+                        processed += count;
+                        info!("[{}] Progress: {}/{} movies synced", lib.name, processed, total);
+
+                        if count < page_size || processed >= total {
+                            break;
+                        }
+                        start_index += count;
+                    }
+                    Err(e) => {
+                        error!("Failed to fetch movies page at index {}: {:#}", start_index, e);
+                        break;
+                    }
+                }
             }
         } else {
             info!("Ignoring library '{}' (type: '{}')", lib.name, col_type);
